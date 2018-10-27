@@ -1,0 +1,444 @@
+---
+title: "Predictive Analysis for NBA"
+output:
+  html_document:
+    df_print: paged
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+---
+This is an automatically generated report, designed to explain and expand up the automatic set of teams generated for the [DraftKings NBA DFS](https://au.draftkings.com/help/rules/4/70) website. 
+
+The methodology for this is fairly simple.
+
+1. **Download** the [daily projections]() from [Basketball Monster](https://basketballmonster.com/).
+
+2. **Calculate** the daily projections from this data using the rules laid out [here](https://au.draftkings.com/help/rules/4/70)
+
+3. **Solve** the linear equation the considers price, position and projection to find the optimum lineup, this is done using the [LPSolve](http://lpsolve.sourceforge.net/5.5/) mixed integer linear programming solver.
+
+4. **Iterate** and remove each of the individual players to introduce variablity into the teams - do this both for individual players as well as combinations of players.
+
+5. **Process** the results to assure that no duplicate teams are entered - as well as removing teams which will violate the rules as the solver cannot perfectly optimize for this problem (see _Disclaimer on the Solver_)
+
+6. **Visualize** the results to assure that sensible norms are being adhered to:
+ + Do we have over exposure to certain players?
+ + Do we have over exposure to certain teams?
+ + Do we _really_ want to rely on PJ Tucker to do anything, given he couldn't score in a brothel?
+ 
+All of these questions (and more) should be asked and answered before inputting teams.
+
+#### Disclaimer on the Solver 
+
+The multi positional nature of the DK set up means that there is a situation where the solver can be satisified but a team cannot be entered into the DraftKings set up - this occurs when the player assigned to the C position has multiple positions. This doesn't occur often, if it does another team is generated in place. Blame K-Love and Julius Randle.
+```{r,echo=FALSE,error=FALSE,message=FALSE}
+require(xlsx)
+require(ggplot2)
+require(lpSolve)
+require(stringr)
+require(dplyr)
+library(knitr)
+library(kableExtra)
+library(lubridate)
+
+Date = "25_10_2018"
+DailyProjections <- read.csv(url(""),stringsAsFactors = FALSE)
+
+if(sum(DailyProjections$draftkings_price)>0){
+  for(i in 1:nrow(DailyProjections)){
+    DailyProjections$draftkings_positions[i] <- as.character(paste0('/',DailyProjections$draftkings_positions[i],'/'))
+    DailyProjections$draftkings_positions[i] <- gsub(";", "/", DailyProjections$draftkings_positions[i])
+    if(length(grep(paste0('/PG/'),DailyProjections$draftkings_positions[i]))>0||length(grep(paste0('/SG/'),DailyProjections$draftkings_positions[i]))>0){
+      DailyProjections$draftkings_positions[i] <- paste0(DailyProjections$draftkings_positions[i],'G/')
+    }
+    if(length(grep(paste0('/PF/'),DailyProjections$draftkings_positions[i]))>0||length(grep(paste0('/SF/'),DailyProjections$draftkings_positions[i]))>0){
+      DailyProjections$draftkings_positions[i] <- paste0(DailyProjections$draftkings_positions[i],'F/')
+    }
+    DailyProjections$draftkings_positions[i] <- paste0(DailyProjections$draftkings_positions[i],'UTIL/')
+  }
+}else{
+DK_CSV <- read.csv(paste0('C:/TheAutoDinWiddie/DKSalaries_',Date,'.csv'))
+for(i in 1:nrow(DailyProjections)){
+  if(length(DK_CSV[paste0(DailyProjections$first_name[i]," ",DailyProjections$last_name[i])==DK_CSV$Name,"Salary"])==1){
+  DailyProjections$draftkings_price[i] <- DK_CSV[paste0(DailyProjections$first_name[i]," ",DailyProjections$last_name[i])==DK_CSV$Name,"Salary"]
+  DailyProjections$draftkings_positions[i] <- paste0('/', as.character(DK_CSV[paste0(DailyProjections$first_name[i]," ",DailyProjections$last_name[i])==DK_CSV$Name,"Roster.Position"]),'/')
+  }else{
+    print(paste0(DailyProjections$first_name[i]," ",DailyProjections$last_name[i]))
+    print(i)
+  }
+ }
+}
+
+
+
+
+DailyProjections$DraftkingsProjections <- 1*DailyProjections$points + 
+  0.5*DailyProjections$threes + 
+  1.25*DailyProjections$rebounds + 
+  1.5*DailyProjections$assists + 
+  2*DailyProjections$blocks + 
+  2*DailyProjections$steals -
+  0.5*DailyProjections$turnovers +
+  1.5*DailyProjections$double.doubles +
+  3 * DailyProjections$triple.doubles
+
+DailyProjections$DraftKings_PointsPerDollar <- DailyProjections$DraftkingsProjections/DailyProjections$draftkings_price*1000
+
+
+DailyProjections = DailyProjections[DailyProjections$status!="Questionable",]
+DailyProjections = DailyProjections[DailyProjections$draftkings_price>0,]
+
+
+```
+
+```{r,echo=FALSE,error=FALSE,message=FALSE,results='hide'}
+Information = data.frame()
+    Information[1,1] = "PG"
+    Information[1,2] = 1
+    Information[2,1] = "SG"
+    Information[2,2] = 1
+    Information[3,1] = "SF"
+    Information[3,2] = 1
+    Information[4,1] = "PF"
+    Information[4,2] = 1
+    Information[5,1] = "C"
+    Information[5,2] = 2
+    Information[6,1] = "G"
+    Information[6,2] = 3
+    Information[7,1] = "F"
+    Information[7,2] = 3
+    Information[8,1] = "UTIL"
+    Information[8,2] = 8
+    
+    
+    
+    TeamCount = 0
+    FinalTeams = list()
+    PlayerProj = list()
+    PlayerPosition = list()
+    EliteCount = numeric(46)
+    SecondaryCount = numeric(46)
+    OtherCount = numeric(46)
+    OverallPrice = numeric(46)
+    
+    A <- matrix(0, nrow = 9, ncol = nrow(DailyProjections))
+      for (i in 1:nrow(DailyProjections)){
+        for (j in 1:8){
+          if (length(grep(paste0('/',Information[j,1],'/'),DailyProjections$draftkings_positions[i]))>0){
+          A[j,i] <- 1
+          }
+        }
+      }
+    A[9, ] <- DailyProjections$draftkings_price
+    const.mat <- A
+    objective.in <- DailyProjections$DraftkingsProjections
+    const.dir <- c(">=",">=",">=",">=","<=",">=",">=","==","<=")
+    const.rhs <- c(Information[1,2], Information[2,2],
+                   Information[3,2],Information[4,2],Information[5,2],
+                   Information[6,2],Information[7,2],Information[8,2],50000)
+    
+    
+    
+    solRaw <- lp(direction = "max", objective.in,     # maximize objective function
+              const.mat, const.dir, const.rhs,all.bin = TRUE,
+              num.bin.solns=1,compute.sens = 1) # use binary variables      only
+    print(solRaw)
+    TeamCount = TeamCount+1
+    FinalTeams[[TeamCount]]=cbind(as.character(DailyProjections[which(solRaw$solution==1),c("first_name")]),as.character(DailyProjections[which(solRaw$solution==1),c("last_name")]))
+    PlayerPosition[[TeamCount]] = as.character(DailyProjections[which(solRaw$solution==1),c("draftkings_positions")])
+    PlayerProj[[TeamCount]] = as.character(DailyProjections[which(solRaw$solution==1),c("draftkings_price")])
+    
+    OtherCount[[TeamCount]] = solRaw$objval
+    OverallPrice[1] = sum(DailyProjections[which(solRaw$solution==1),c("draftkings_price")])
+    
+    for (i in 1:8){
+    DailyProjectionsTemp = DailyProjections[-which(solRaw$solution==1)[i],]
+    
+    ATemp <- A[,-which(solRaw$solution==1)[i]]
+
+    const.mat <- ATemp
+    objective.in <- DailyProjectionsTemp$DraftkingsProjections
+    sol <- lp(direction = "max", objective.in,     # maximize objective function
+              const.mat, const.dir, const.rhs,     # constraints
+              all.bin = TRUE,use.rw = TRUE, num.bin.solns=1,compute.sens = 1) # use binary variables
+    print(sol)
+    TeamCount = TeamCount+1
+    FinalTeams[[TeamCount]]=cbind(as.character(DailyProjectionsTemp[which(sol$solution==1),c("first_name")]),as.character(DailyProjectionsTemp[which(sol$solution==1),c("last_name")]))
+    PlayerPosition[[TeamCount]] = as.character(DailyProjectionsTemp[which(sol$solution==1),"draftkings_positions"])
+    PlayerProj[[TeamCount]] = as.character(DailyProjectionsTemp[which(sol$solution==1),"draftkings_price"])
+    
+    OtherCount[[TeamCount]] = sol$objval
+    OverallPrice[TeamCount] = sum(DailyProjectionsTemp[which(sol$solution==1),c("draftkings_price")])
+    }
+    
+    
+    
+    
+    for (i in 1:7){
+       for (ii in (i+1):8){
+            DailyProjectionsTemp = DailyProjections[-which(solRaw$solution==1)[c(i,ii)],]
+            ATemp <- A[,-which(solRaw$solution==1)[c(i,ii)]]
+
+            const.mat <- ATemp
+            objective.in <- DailyProjectionsTemp$DraftkingsProjections
+            sol <- lp(direction = "max", objective.in,     # maximize objective function
+                      const.mat, const.dir, const.rhs,     # constraints
+                      all.bin = TRUE,use.rw = TRUE, num.bin.solns=1,compute.sens = 1)
+            
+            print(sol)
+         TeamCount = TeamCount+1
+    FinalTeams[[TeamCount]]=cbind(as.character(DailyProjectionsTemp[which(sol$solution==1),c("first_name")]),as.character(DailyProjectionsTemp[which(sol$solution==1),c("last_name")]))   
+    PlayerPosition[[TeamCount]] = as.character(DailyProjectionsTemp[which(sol$solution==1),"draftkings_positions"])
+    PlayerProj[[TeamCount]] = as.character(DailyProjectionsTemp[which(sol$solution==1),"draftkings_price"])
+     
+    OtherCount[[TeamCount]] = sol$objval
+    OverallPrice[TeamCount] = sum(DailyProjectionsTemp[which(sol$solution==1),"draftkings_price"])
+       }
+       
+    }
+    
+
+    for (i in 1:6){
+       for (ii in (i+1):7){
+         for (iii in (ii+1):8){
+            DailyProjectionsTemp = DailyProjections[-which(solRaw$solution==1)[c(i,ii,iii)],]
+            ATemp <- A[,-which(solRaw$solution==1)[c(i,ii,iii)]]
+            
+            const.mat <- ATemp
+            objective.in <- DailyProjectionsTemp$DraftkingsProjections
+            sol <- lp(direction = "max", objective.in,     # maximize objective function
+                      const.mat, const.dir, const.rhs,     # constraints
+                      all.bin = TRUE,use.rw = TRUE, num.bin.solns=1,compute.sens = 1) # use binary variables
+         TeamCount = TeamCount+1
+    FinalTeams[[TeamCount]]=cbind(as.character(DailyProjectionsTemp[which(sol$solution==1),c("first_name")]),as.character(DailyProjectionsTemp[which(sol$solution==1),c("last_name")]))   
+    PlayerPosition[[TeamCount]] = as.character(DailyProjectionsTemp[which(sol$solution==1),"draftkings_positions"])
+    PlayerProj[[TeamCount]] = as.character(DailyProjectionsTemp[which(sol$solution==1),"draftkings_price"])
+     
+    OtherCount[[TeamCount]] = sol$objval
+    OverallPrice[TeamCount] = sum(DailyProjectionsTemp[which(sol$solution==1),"draftkings_price"])
+       }
+       
+       }
+    }
+    
+    for (i in 1:5){
+       for (ii in (i+1):6){
+         for (iii in (ii+1):7){
+           for (iv in (iii+1):8){
+            DailyProjectionsTemp = DailyProjections[-which(solRaw$solution==1)[c(i,ii,iii,iv)],]
+            ATemp <- A[,-which(solRaw$solution==1)[c(i,ii,iii,iv)]]
+            
+            const.mat <- ATemp
+            objective.in <- DailyProjectionsTemp$DraftkingsProjections
+            sol <- lp(direction = "max", objective.in,     # maximize objective function
+                      const.mat, const.dir, const.rhs,     # constraints
+                      all.bin = TRUE,use.rw = TRUE, num.bin.solns=1,compute.sens = 1) # use binary variables
+         TeamCount = TeamCount+1
+    FinalTeams[[TeamCount]]=cbind(as.character(DailyProjectionsTemp[which(sol$solution==1),c("first_name")]),as.character(DailyProjectionsTemp[which(sol$solution==1),c("last_name")]))   
+    PlayerPosition[[TeamCount]] = as.character(DailyProjectionsTemp[which(sol$solution==1),"draftkings_positions"])
+    PlayerProj[[TeamCount]] = as.character(DailyProjectionsTemp[which(sol$solution==1),"draftkings_price"])
+     
+    OtherCount[[TeamCount]] = sol$objval
+    OverallPrice[TeamCount] = sum(DailyProjectionsTemp[which(sol$solution==1),"draftkings_price"])
+       }
+       
+       }
+       }
+    }
+```
+
+
+```{r,echo=FALSE,error=FALSE,message=FALSE,results='hide'}
+TotalCount = !duplicated(FinalTeams)
+  for (i in 1:163){
+  	if (i == 1){
+  	PlayerPosition[[1]][PlayerPosition[[1]]=="PG"]="Z"
+	  FinalTeamsPlayers <- as.data.frame(cbind(FinalTeams[[1]],TotalCount[[1]],1,PlayerPosition[[1]],PlayerProj[[1]],OverallPrice[1]))
+	  FinalTeamsPlayers <- FinalTeamsPlayers[order(FinalTeamsPlayers$V5,decreasing = TRUE),]
+	  levels(FinalTeamsPlayers$V5)[levels(FinalTeamsPlayers$V5)=="Z"] <- "PG"
+	  colnames(FinalTeamsPlayers) <- c("First","Last","Put in?","IterationNumber","Position","Value","OverallPrice")
+	  }else{
+	  PlayerPosition[[i]][PlayerPosition[[i]]=="PG"]="Z"  
+	  FinalTeamsPlayersTemp <- as.data.frame(cbind(FinalTeams[[i]],TotalCount[[i]],i,PlayerPosition[[i]],PlayerProj[[i]],OverallPrice[i]))
+	  FinalTeamsPlayersTemp <- FinalTeamsPlayersTemp[order(FinalTeamsPlayersTemp$V5,decreasing = TRUE),]
+	   levels(FinalTeamsPlayersTemp$V5)[levels(FinalTeamsPlayersTemp$V5)=="Z"] <- "PG"
+	   colnames(FinalTeamsPlayersTemp) <- c("First","Last","Put in?","IterationNumber","Position","Value","OverallPrice")
+	  FinalTeamsPlayers <- rbind(FinalTeamsPlayers,FinalTeamsPlayersTemp)
+	  }
+  }
+
+Assigned = character(163*9)
+Counter = 0
+ for (i in 1:93){
+   if (!duplicated(FinalTeams)[i]==TRUE){
+   Counter = Counter+1
+    if (Counter>0&Counter<=25){
+      Assigned[((i-1)*9)+1] = paste('TC',Counter)
+      Assigned[(i*9)] = paste('TC',Counter)
+    }
+   if(Counter>15&Counter<=30){
+      Assigned[((i-1)*9)+1] = paste('LW',Counter-15)
+      Assigned[(i*9)] = paste('LW',Counter-15)
+    }
+    if(Counter>30&Counter<=45){
+       Assigned[((i-1)*9)+1] = paste('BP',Counter-30)
+       Assigned[i*9] = paste('BP',Counter-30)
+     }
+   }
+   
+ }
+# FinalTeamsPlayers <- cbind(FinalTeamsPlayers,Assigned)
+# write.csv(FinalTeamsPlayers,paste('C:/Working Folder/AutoDinWiddie/DataToPull/Days Teams/TeamsEntered_',Date,'.csv',sep = ""),row.names = FALSE)
+```
+
+```{r,echo=FALSE,error=FALSE,message=FALSE,results='hide'}
+DK_CSV <- read.csv(paste0('C:/TheAutoDinWiddie/DKSalaries_',Date,'.csv'))
+
+FinalTeamsPlayers$DraftKingsID <- 0
+
+for(i in 1:nrow(FinalTeamsPlayers)){
+  if(length(DK_CSV[paste0(FinalTeamsPlayers$First[i]," ",FinalTeamsPlayers$Last[i])==DK_CSV$Name,"Salary"])==1){
+  FinalTeamsPlayers$DraftKingsID[i] <- DK_CSV[paste0(FinalTeamsPlayers$First[i]," ",FinalTeamsPlayers$Last[i])==DK_CSV$Name,"ID"]
+  }else{
+    print(paste0(FinalTeamsPlayers$First[i]," ",FinalTeamsPlayers$Last[i]))
+    print(i)
+  }
+ }
+
+
+
+
+TodaysLength <- length(which(FinalTeamsPlayers$`Put in?`==TRUE))/8
+
+OutputID <- as.data.frame(matrix(data=0,nrow = TodaysLength,ncol = 8))
+OutputLast <- as.data.frame(matrix(data=0,nrow = TodaysLength,ncol = 8))
+colnames(OutputID) <- c("PG","SG","SF","PF","C","G","F","UTIL")
+
+
+Count = 0
+for (i in 1:163){
+  
+  TempTeam <- FinalTeamsPlayers[FinalTeamsPlayers$IterationNumber==i,]
+  if(TempTeam$`Put in?`[1]==FALSE){
+    
+  }else{
+  Count = Count+1
+  A <- 0
+  Counter = 0 
+  while(A==0){
+    TempTeam <- FinalTeamsPlayers[FinalTeamsPlayers$IterationNumber==i,]
+    A = 1
+    Counter = Counter + 1
+    ## - Point Guards
+    TempPG <- TempTeam[grep(paste0('/PG/'),TempTeam$Position),]
+    PGPick <- sample_n(TempPG,1)
+    OutputID[Count,1] <- as.character(PGPick$DraftKingsID)
+    OutputLast[Count,1] <- as.character(PGPick$Last)
+    TempTeam <- TempTeam[!paste0(PGPick$First,PGPick$Last)==paste0(TempTeam$First,TempTeam$Last),]
+    
+    
+    ## - Shooting Guards
+    TempSG <- TempTeam[grep(paste0('/SG/'),TempTeam$Position),]
+    if (nrow(TempSG)>0){
+      SGPick <- sample_n(TempSG,1)
+      OutputID[Count,2] <- as.character(SGPick$DraftKingsID)
+      OutputLast[Count,2] <- as.character(SGPick$Last)
+      TempTeam <- TempTeam[!paste0(SGPick$First,SGPick$Last)==paste0(TempTeam$First,TempTeam$Last),]
+    }else{
+      A = 0 
+    }
+    
+    ## - Small Forwards
+    TempSF <- TempTeam[grep(paste0('/SF/'),TempTeam$Position),]
+    if (nrow(TempSF)>0){
+      SFPick <- sample_n(TempSF,1)
+      OutputID[Count,3] <- as.character(SFPick$DraftKingsID)
+      OutputLast[Count,3] <- as.character(SFPick$Last)
+      TempTeam <- TempTeam[!paste0(SFPick$First,SFPick$Last)==paste0(TempTeam$First,TempTeam$Last),]
+    }else{
+      A = 0 
+    }
+    
+    ## - Power Forwards
+    TempPF <- TempTeam[grep(paste0('/PF/'),TempTeam$Position),]
+    if (nrow(TempPF)>0){
+      PFPick <- sample_n(TempPF,1)
+      OutputID[Count,4] <- as.character(PFPick$DraftKingsID)
+      OutputLast[Count,4] <- as.character(PFPick$Last)
+      TempTeam <- TempTeam[!paste0(PFPick$First,PFPick$Last)==paste0(TempTeam$First,TempTeam$Last),]
+    }else{
+      A = 0 
+    }
+    
+    ## - Centers
+    TempC <- TempTeam[grep(paste0('/C/'),TempTeam$Position),]
+    if (nrow(TempC)>0){
+      CPick <- sample_n(TempC,1)
+      OutputID[Count,5] <- as.character(CPick$DraftKingsID)
+      OutputLast[Count,5] <- as.character(CPick$Last)
+      TempTeam <- TempTeam[!paste0(CPick$First,CPick$Last)==paste0(TempTeam$First,TempTeam$Last),]
+    }else{
+      A = 0 
+    }
+
+    ## - Guard
+    TempG <- TempTeam[grep(paste0('/G/'),TempTeam$Position),]
+    if (nrow(TempG)>0){
+      GPick <- sample_n(TempG,1)
+      OutputID[Count,6] <- as.character(GPick$DraftKingsID)
+      OutputLast[Count,6] <- as.character(GPick$Last)
+      TempTeam <- TempTeam[!paste0(GPick$First,GPick$Last)==paste0(TempTeam$First,TempTeam$Last),]
+    }else{
+      A = 0
+    }
+    
+    ## - Forwards
+    TempF <- TempTeam[grep(paste0('/F/'),TempTeam$Position),]
+    if (nrow(TempF)>0){
+      FPick <- sample_n(TempF,1)
+      OutputID[Count,7] <- as.character(FPick$DraftKingsID)
+      OutputLast[Count,7] <- as.character(FPick$Last)
+      TempTeam <- TempTeam[!paste0(FPick$First,FPick$Last)==paste0(TempTeam$First,TempTeam$Last),]
+    }else{
+      A = 0
+    }
+
+    if(nrow(TempTeam)==1){
+    OutputID[Count,8] <- as.character(TempTeam$DraftKingsID)
+    OutputLast[Count,8] <- as.character(TempTeam$Last)
+    }
+
+    if(Counter==100){
+
+      A=1
+      OutputID[Count,] <- 0
+      #OutputLast[Count,] <- 0
+  }
+  }
+  print(i)
+  if(Counter==100){
+    print("Failure")
+  }
+  
+  }
+}
+
+write.csv(OutputID,paste0('C:/TheAutoDinWiddie/DK_AutoImport_IDs',Date,'.csv'),row.names = FALSE)
+write.csv(OutputLast,paste0('C:/TheAutoDinWiddie/DK_AutoImport_Names',Date,'.csv'),row.names = FALSE)
+
+```
+
+## Welcome to the first team for the `r day(today())` of `r as.character(month(today(),label = TRUE,abbr = FALSE))`, `r year(today())` 
+```{r,error=FALSE,message=FALSE,echo=FALSE,}
+FinalTeamsPlayers[FinalTeamsPlayers$IterationNumber==1,c(1,2,5,6,7,8)] %>%
+  mutate(Value = as.numeric(as.character(Value))) %>%
+   mutate(Value = cell_spec(
+    Value, color = spec_color(Value, end = 0.9,direction = -1), bold = T
+  )) %>% 
+  kable(escape = F, align = "c") %>%
+  kable_styling(c("striped", "condensed"), full_width = F) %>%
+  footnote(general = paste0("This team is projected to score ",round(solRaw$objval,2)),
+           general_title = "Note: ", number_title = "Type I: ",
+           alphabet_title = "Type II: ", symbol_title = "Type III: ",
+           footnote_as_chunk = T, title_format = c("italic", "underline")
+           )
+```
+
